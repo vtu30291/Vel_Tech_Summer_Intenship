@@ -2,8 +2,16 @@
 Document ingestion pipeline: PDF extraction, token-based chunking,
 embedding generation, MySQL storage, and FAISS index insertion.
 Runs in background threads to avoid blocking Flask request handlers.
+
+Memory-optimised for Render free-tier (512 MB):
+  - Embeddings are generated in small batches (EMBED_BATCH_SIZE chunks at a time).
+  - Each batch is written to FAISS immediately, then freed with del + gc.collect().
+  - The large raw text string is released after chunking.
+  - torch.no_grad() prevents PyTorch from allocating gradient buffers.
+  - Only one SentenceTransformer singleton is kept in memory at any time.
 """
 
+import gc
 import os
 import traceback
 import numpy as np
@@ -16,6 +24,11 @@ from vector_store import VectorStoreManager
 
 logger = logging.getLogger(__name__)
 
+# Batch size for embedding generation.
+# 2 chunks at a time keeps peak RAM well under 512 MB on Render free-tier.
+# Increase to 4 only if you are on a paid instance with more headroom.
+EMBED_BATCH_SIZE: int = 2
+
 _model = None
 _model_lock = threading.Lock()
 
@@ -23,7 +36,7 @@ _model_lock = threading.Lock()
 def get_embedding_model():
     """
     Lazy-load and cache the SentenceTransformer model (thread-safe singleton).
-    BUG FIX: Removed redundant inner 'import os' that shadowed the module-level import.
+    Only one model instance ever lives in memory.
     """
     global _model
     with _model_lock:
@@ -41,7 +54,8 @@ def get_embedding_model():
 
 def extract_text_from_pdf(pdf_path: str) -> str:
     """
-    Extract text characters cleanly from private binary PDF files using PyMuPDF.
+    Extract text characters cleanly from a PDF using PyMuPDF.
+    The fitz.Document is explicitly closed to free native memory immediately.
     """
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"PDF file not found at {pdf_path}")
@@ -53,6 +67,7 @@ def extract_text_from_pdf(pdf_path: str) -> str:
     for page in doc:
         text += page.get_text("text")
     doc.close()
+    del doc
     return text
 
 
@@ -62,8 +77,9 @@ def semantic_chunking(
     overlap: int = config.CHUNK_OVERLAP,
 ) -> list:
     """
-    Semantic chunking logic that cuts raw text into overlapping spans
-    of approximately 500 tokens (configurable via config.py).
+    Cuts raw text into overlapping token-spans (~500 tokens each).
+    Returns a plain Python list of strings; the encoded token list is freed
+    before returning to avoid keeping two copies of the document in memory.
     """
     model = get_embedding_model()
     tokenizer = model.tokenizer
@@ -74,8 +90,9 @@ def semantic_chunking(
 
     chunks = []
     if len(tokens) <= chunk_size:
-        # If smaller than chunk size, return single decoded text
-        return [tokenizer.decode(tokens, skip_special_tokens=True)]
+        single = tokenizer.decode(tokens, skip_special_tokens=True)
+        del tokens
+        return [single]
 
     start_idx = 0
     step = chunk_size - overlap
@@ -84,27 +101,50 @@ def semantic_chunking(
         end_idx = min(start_idx + chunk_size, len(tokens))
         chunk_tokens = tokens[start_idx:end_idx]
         chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
-        # Only add non-empty chunks
+        del chunk_tokens  # free slice immediately
         if chunk_text.strip():
             chunks.append(chunk_text)
-
         if end_idx == len(tokens):
             break
         start_idx += step
 
+    del tokens  # free the full token list now that chunking is done
     return chunks
+
+
+def _encode_batch_no_grad(model, batch: list) -> np.ndarray:
+    """
+    Encode a small list of strings under torch.no_grad() to prevent PyTorch
+    from allocating gradient buffers. Returns a float32 NumPy array.
+    """
+    try:
+        import torch
+        with torch.no_grad():
+            vecs = model.encode(batch, convert_to_numpy=True, show_progress_bar=False)
+    except ImportError:
+        # torch not directly importable in some environments; fall back gracefully
+        vecs = model.encode(batch, convert_to_numpy=True, show_progress_bar=False)
+    return np.array(vecs, dtype="float32")
 
 
 def process_document_ingestion(
     material_id: str, file_path: str, vector_store: VectorStoreManager
 ):
     """
-    Ingests a PDF document: extracts text, chunks, vectorizes, saves to DB,
-    saves to FAISS, and updates status to active.
-    This runs in a background thread to prevent REST API blocks.
+    Ingests a PDF document in a memory-efficient streaming fashion:
+      1. Extract text → release PDF
+      2. Chunk text → release raw text string
+      3. Open DB transaction + acquire FAISS ID range
+      4. For each small batch of chunks:
+           a. Encode with torch.no_grad()
+           b. Insert chunk rows into MySQL
+           c. Write vectors to FAISS
+           d. Free the batch tensors (del + gc.collect())
+      5. UPDATE materials → commit transaction
+      6. Verify DB record
 
-    Each major step is wrapped in its own try/except with full traceback logging
-    so that any failure produces a complete error message in Render logs.
+    Each major step is wrapped in its own try/except with full traceback
+    so that any failure is fully visible in Render logs.
     """
     logger.info(
         f"[INGESTION START] material_id={material_id} | file_path={file_path}"
@@ -131,11 +171,14 @@ def process_document_ingestion(
         return
 
     # ------------------------------------------------------------------ #
-    # STEP 2: Semantic chunking
+    # STEP 2: Semantic chunking (release raw text immediately after)
     # ------------------------------------------------------------------ #
     try:
         logger.info(f"[STEP 2] Running semantic chunking for material {material_id}")
         chunks = semantic_chunking(text)
+        # Release the large raw text string — chunks hold all we need now.
+        del text
+        gc.collect()
         if not chunks:
             raise ValueError("Document was empty or generated zero chunks.")
         logger.info(
@@ -150,58 +193,40 @@ def process_document_ingestion(
         return
 
     # ------------------------------------------------------------------ #
-    # STEP 3: Generate embeddings
+    # STEP 3: Open DB connection and begin explicit transaction
     # ------------------------------------------------------------------ #
     try:
-        logger.info(f"[STEP 3] Generating embeddings for material {material_id}")
-        model = get_embedding_model()
-        embeddings = model.encode(chunks)
-        embeddings = np.array(embeddings).astype("float32")
-        logger.info(
-            f"[STEP 3 OK] Embeddings shape: {embeddings.shape} for material {material_id}"
-        )
-    except Exception:
-        logger.exception(
-            f"[STEP 3 FAILED] Embedding generation failed for material {material_id}.\n"
-            + traceback.format_exc()
-        )
-        _mark_inactive(material_id)
-        return
-
-    # ------------------------------------------------------------------ #
-    # STEP 4: Open DB connection with autocommit=False (explicit transaction)
-    # ------------------------------------------------------------------ #
-    try:
-        logger.info(f"[STEP 4] Opening DB connection for material {material_id}")
+        logger.info(f"[STEP 3] Opening DB connection for material {material_id}")
         conn = get_db_connection()
-        conn.autocommit = False  # Ensure explicit transaction control
+        conn.autocommit = False  # explicit transaction control
         cursor = conn.cursor()
-        logger.info(f"[STEP 4 OK] DB connection established for material {material_id}")
+        logger.info(f"[STEP 3 OK] DB connection established for material {material_id}")
     except Exception:
         logger.exception(
-            f"[STEP 4 FAILED] DB connection failed for material {material_id}.\n"
+            f"[STEP 3 FAILED] DB connection failed for material {material_id}.\n"
             + traceback.format_exc()
         )
         _mark_inactive(material_id)
         return
 
     # ------------------------------------------------------------------ #
-    # STEP 5: Lock chunks table and determine FAISS IDs
+    # STEP 4: Lock chunks table and determine starting FAISS ID
     # ------------------------------------------------------------------ #
     try:
         logger.info(
-            f"[STEP 5] Acquiring row-level lock and computing FAISS IDs for material {material_id}"
+            f"[STEP 4] Acquiring row-level lock and computing FAISS start_id "
+            f"for material {material_id}"
         )
         cursor.execute("SELECT COALESCE(MAX(id), 0) FROM chunks FOR UPDATE")
         row = cursor.fetchone()
         start_id = row[0] + 1
         logger.info(
-            f"[STEP 5 OK] FAISS start_id={start_id} for material {material_id}"
+            f"[STEP 4 OK] FAISS start_id={start_id} for material {material_id}"
         )
     except Exception:
         logger.exception(
-            f"[STEP 5 FAILED] Failed to acquire lock / compute FAISS IDs for material {material_id}.\n"
-            + traceback.format_exc()
+            f"[STEP 4 FAILED] Failed to acquire lock / compute FAISS IDs "
+            f"for material {material_id}.\n" + traceback.format_exc()
         )
         try:
             conn.rollback()
@@ -211,88 +236,130 @@ def process_document_ingestion(
         return
 
     # ------------------------------------------------------------------ #
-    # STEP 6: Bulk-insert chunks into MySQL
+    # STEP 5: Stream through chunks in small batches — encode → DB → FAISS → free
     # ------------------------------------------------------------------ #
-    faiss_ids = []
+    total_chunks = len(chunks)
+    model = get_embedding_model()
+    insert_query = """
+        INSERT INTO chunks (material_id, chunk_index, text_content, faiss_id)
+        VALUES (%s, %s, %s, %s)
+    """
+
     try:
         logger.info(
-            f"[STEP 6] Bulk-inserting {len(chunks)} chunks into MySQL for material {material_id}"
+            f"[STEP 5] Processing {total_chunks} chunks in batches of "
+            f"{EMBED_BATCH_SIZE} for material {material_id}"
         )
-        chunk_insert_data = []
-        for idx, chunk_text in enumerate(chunks):
-            faiss_id = start_id + idx
-            faiss_ids.append(faiss_id)
-            chunk_insert_data.append((material_id, idx, chunk_text, faiss_id))
 
-        insert_query = """
-            INSERT INTO chunks (material_id, chunk_index, text_content, faiss_id)
-            VALUES (%s, %s, %s, %s)
-        """
-        cursor.executemany(insert_query, chunk_insert_data)
+        for batch_start in range(0, total_chunks, EMBED_BATCH_SIZE):
+            batch_end = min(batch_start + EMBED_BATCH_SIZE, total_chunks)
+            batch_texts = chunks[batch_start:batch_end]
+            batch_indices = list(range(batch_start, batch_end))
+            batch_faiss_ids = [start_id + i for i in batch_indices]
+
+            logger.info(
+                f"[STEP 5] Encoding batch chunks[{batch_start}:{batch_end}] "
+                f"(faiss_ids {batch_faiss_ids[0]}..{batch_faiss_ids[-1]}) "
+                f"for material {material_id}"
+            )
+
+            # 5a: Encode under no_grad — minimal memory footprint
+            try:
+                batch_embeddings = _encode_batch_no_grad(model, batch_texts)
+            except Exception:
+                logger.exception(
+                    f"[STEP 5 FAILED] Embedding failed for batch "
+                    f"chunks[{batch_start}:{batch_end}] material {material_id}.\n"
+                    + traceback.format_exc()
+                )
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                _mark_inactive(material_id)
+                return
+
+            # 5b: Insert chunk rows into MySQL
+            try:
+                chunk_rows = [
+                    (material_id, batch_indices[i], batch_texts[i], batch_faiss_ids[i])
+                    for i in range(len(batch_texts))
+                ]
+                cursor.executemany(insert_query, chunk_rows)
+            except Exception:
+                logger.exception(
+                    f"[STEP 5 FAILED] MySQL insert failed for batch "
+                    f"chunks[{batch_start}:{batch_end}] material {material_id}.\n"
+                    + traceback.format_exc()
+                )
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                _mark_inactive(material_id)
+                return
+
+            # 5c: Write this batch of vectors to FAISS immediately
+            try:
+                faiss_ids_arr = np.array(batch_faiss_ids, dtype=np.int64)
+                vector_store.add_vectors(batch_embeddings, faiss_ids_arr)
+                logger.info(
+                    f"[STEP 5] Batch chunks[{batch_start}:{batch_end}] written to FAISS. "
+                    f"Index total: {vector_store.get_total_vectors()}"
+                )
+            except Exception:
+                logger.exception(
+                    f"[STEP 5 FAILED] FAISS write failed for batch "
+                    f"chunks[{batch_start}:{batch_end}] material {material_id}.\n"
+                    + traceback.format_exc()
+                )
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                _mark_inactive(material_id)
+                return
+
+            # 5d: Explicitly free this batch's memory before next iteration
+            del batch_embeddings, batch_texts, faiss_ids_arr, chunk_rows
+            gc.collect()
+
         logger.info(
-            f"[STEP 6 OK] Inserted {len(chunks)} chunk rows for material {material_id}"
+            f"[STEP 5 OK] All {total_chunks} chunks processed for material {material_id}"
         )
-    except Exception:
-        logger.exception(
-            f"[STEP 6 FAILED] MySQL chunk insert failed for material {material_id}.\n"
-            + traceback.format_exc()
-        )
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        _mark_inactive(material_id)
-        return
+
+    finally:
+        # Release the full chunks list now that all batches are done (or failed)
+        del chunks
+        gc.collect()
 
     # ------------------------------------------------------------------ #
-    # STEP 7: Add vectors to FAISS index
+    # STEP 6: UPDATE materials — set index_id, chunk_count, status='active'
     # ------------------------------------------------------------------ #
     try:
         logger.info(
-            f"[STEP 7] Adding {len(faiss_ids)} vectors to FAISS for material {material_id}"
-        )
-        faiss_ids_arr = np.array(faiss_ids, dtype=np.int64)
-        vector_store.add_vectors(embeddings, faiss_ids_arr)
-        logger.info(
-            f"[STEP 7 OK] FAISS index updated. Total vectors in index: {vector_store.get_total_vectors()}"
-        )
-    except Exception:
-        logger.exception(
-            f"[STEP 7 FAILED] FAISS add_vectors failed for material {material_id}.\n"
-            + traceback.format_exc()
-        )
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        _mark_inactive(material_id)
-        return
-
-    # ------------------------------------------------------------------ #
-    # STEP 8: Update materials table — set index_id, chunk_count, status='active'
-    # ------------------------------------------------------------------ #
-    try:
-        logger.info(
-            f"[STEP 8] Updating materials table to 'active' for material {material_id} "
-            f"(chunk_count={len(chunks)}, index_id={start_id})"
+            f"[STEP 6] Updating materials table to 'active' for material {material_id} "
+            f"(chunk_count={total_chunks}, index_id={start_id})"
         )
         update_query = """
             UPDATE materials
             SET index_id = %s, chunk_count = %s, status = 'active'
             WHERE id = %s
         """
-        cursor.execute(update_query, (str(start_id), len(chunks), material_id))
+        cursor.execute(update_query, (str(start_id), total_chunks, material_id))
         rows_affected = cursor.rowcount
         logger.info(
-            f"[STEP 8 OK] UPDATE materials affected {rows_affected} row(s) for material {material_id}"
+            f"[STEP 6 OK] UPDATE materials affected {rows_affected} row(s) "
+            f"for material {material_id}"
         )
         if rows_affected == 0:
             logger.warning(
-                f"[STEP 8 WARN] UPDATE matched 0 rows — material {material_id} may not exist in DB!"
+                f"[STEP 6 WARN] UPDATE matched 0 rows — "
+                f"material {material_id} may not exist in DB!"
             )
     except Exception:
         logger.exception(
-            f"[STEP 8 FAILED] UPDATE materials failed for material {material_id}.\n"
+            f"[STEP 6 FAILED] UPDATE materials failed for material {material_id}.\n"
             + traceback.format_exc()
         )
         try:
@@ -303,17 +370,17 @@ def process_document_ingestion(
         return
 
     # ------------------------------------------------------------------ #
-    # STEP 9: Commit the transaction
+    # STEP 7: Commit the transaction
     # ------------------------------------------------------------------ #
     try:
-        logger.info(f"[STEP 9] Committing transaction for material {material_id}")
+        logger.info(f"[STEP 7] Committing transaction for material {material_id}")
         conn.commit()
         logger.info(
-            f"[STEP 9 OK] Transaction committed successfully for material {material_id}"
+            f"[STEP 7 OK] Transaction committed successfully for material {material_id}"
         )
     except Exception:
         logger.exception(
-            f"[STEP 9 FAILED] conn.commit() failed for material {material_id}.\n"
+            f"[STEP 7 FAILED] conn.commit() failed for material {material_id}.\n"
             + traceback.format_exc()
         )
         try:
@@ -327,9 +394,13 @@ def process_document_ingestion(
             cursor.close()
         except Exception:
             pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
-    # STEP 10: Verify the DB record was persisted correctly
+    # STEP 8: Post-commit verification SELECT
     # ------------------------------------------------------------------ #
     try:
         verify_conn = get_db_connection()
@@ -343,17 +414,17 @@ def process_document_ingestion(
         verify_conn.close()
         if record:
             logger.info(
-                f"[STEP 10 VERIFY] material_id={material_id} -> "
+                f"[STEP 8 VERIFY] material_id={material_id} -> "
                 f"status={record['status']}, chunk_count={record['chunk_count']}, "
                 f"index_id={record['index_id']}"
             )
         else:
             logger.warning(
-                f"[STEP 10 WARN] Could not find material {material_id} in DB after commit!"
+                f"[STEP 8 WARN] Could not find material {material_id} in DB after commit!"
             )
     except Exception:
         logger.exception(
-            f"[STEP 10 WARN] Post-commit verification query failed for material {material_id}.\n"
+            f"[STEP 8 WARN] Post-commit verification failed for material {material_id}.\n"
             + traceback.format_exc()
         )
 
@@ -361,17 +432,11 @@ def process_document_ingestion(
         f"[INGESTION COMPLETE] material_id={material_id} successfully activated."
     )
 
-    # Close the main connection
-    try:
-        conn.close()
-    except Exception:
-        pass
-
 
 def _mark_inactive(material_id: str):
     """
-    Attempts to set the material status back to 'inactive' after a pipeline failure.
-    Uses a fresh connection to avoid reusing a broken transaction.
+    Marks the material as 'inactive' after a pipeline failure.
+    Always uses a fresh DB connection to avoid inheriting a broken transaction.
     """
     logger.info(
         f"[ROLLBACK] Attempting to mark material {material_id} as inactive..."
